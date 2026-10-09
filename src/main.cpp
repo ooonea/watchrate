@@ -482,6 +482,8 @@ class Window : public QMainWindow {
             }
         }
         QApplication::setPalette(p);
+        setPalette(p);
+        setStyleSheet(styleSheet());
     }
 protected:
     void closeEvent(QCloseEvent *event) override {
