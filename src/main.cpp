@@ -1,6 +1,15 @@
 #include <QApplication>
 #include <QMainWindow>
 #include <QComboBox>
+#include <QListWidget>
+#include <QToolButton>
+#include <QMenu>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QLineEdit>
+#include <QFrame>
+#include <QStackedWidget>
+#include <QCloseEvent>
 #include <QDateTimeEdit>
 #include <QPushButton>
 #include <QLabel>
@@ -124,7 +133,12 @@ public:
 
 class Window : public QMainWindow {
     QSqlDatabase db;
-    QComboBox *watches;
+    QListWidget *watches;
+    QPushButton *add, *edit, *remove, *up, *down;
+    QToolButton *sortButton, *options;
+    QLabel *watchTitle, *watchKind, *phase, *latest;
+    QWidget *reading;
+    QStackedWidget *pages;
     QDateTimeEdit *expected;
     QPushButton *arm, *capture, *discard;
     QLabel *clock, *referenceLabel, *result, *rate;
@@ -157,9 +171,20 @@ class Window : public QMainWindow {
         armed = value;
         expected->setEnabled(pending && !value);
         watches->setEnabled(!value && !pending);
-        arm->setText(pending ? "Salva misura" : value ? "Annulla" : "Prepara misura");
+        arm->setText(pending ? "Salva misura" : "Nuova misura");
+        arm->setVisible(!value);
+        arm->setEnabled(watchId != 0);
         capture->setEnabled(value);
-        discard->setEnabled(value || pending);
+        capture->setVisible(value);
+        discard->setVisible(value || pending);
+        reading->setVisible(pending);
+        phase->setText(pending ? "3 · Inserisci la lettura" : value ? "2 · Premi Stop" : "1 · Prepara la misura");
+        bool idle = !value && !pending;
+        add->setEnabled(idle); edit->setEnabled(idle && watchId); remove->setEnabled(idle && watchId);
+        up->setEnabled(idle && watches->currentRow() > 0);
+        down->setEnabled(idle && watches->currentRow() >= 0 && watches->currentRow() + 1 < watches->count());
+        sortButton->setEnabled(idle && watches->count() > 1);
+        options->setEnabled(idle && watchId);
     }
     void prepare() {
         if (pending) { save(); return; }
@@ -169,7 +194,7 @@ class Window : public QMainWindow {
         started = stamp();
         setArmed(true);
         capture->setFocus();
-        result->setText("Premi Spazio e memorizza l’ora segnata dal tuo orologio allo stop");
+        result->setText("Al passaggio della lancetta premi Spazio. Ricorda l’ora segnata allo Stop.");
     }
     void record(Stamp event) {
         if (!armed) return;
@@ -181,7 +206,8 @@ class Window : public QMainWindow {
         pending = true;
         setArmed(false);
         expected->setDateTime(QDateTime::fromMSecsSinceEpoch(event.utc / 1000000000 * 1000));
-        result->setText("Riferimento congelato. Inserisci l’ora del tuo orologio allo stop, poi salva.");
+        result->setText("Il riferimento è congelato: puoi inserire la lettura con calma.");
+        expected->setCurrentSection(QDateTimeEdit::SecondSection);
         expected->setFocus();
     }
     void save() {
@@ -206,22 +232,62 @@ class Window : public QMainWindow {
         setArmed(false);
         result->setText("Misura annullata");
     }
-    void reloadWatches() {
+    void reloadWatches(qint64 selected = 0) {
+        if (!selected) selected = watchId;
         QSignalBlocker block(watches);
         watches->clear();
-        QSqlQuery q("SELECT id,name,kind FROM watches ORDER BY name", db);
+        QSqlQuery q("SELECT id,name,kind FROM watches ORDER BY sort_order,name COLLATE NOCASE,id", db);
         sqlCheck(!q.lastError().isValid(), q.lastError());
-        while (q.next()) watches->addItem(q.value(1).toString() + " · " + q.value(2).toString(), q.value(0));
+        int row = 0;
+        while (q.next()) {
+            auto item = new QListWidgetItem(QIcon::fromTheme("chronometer"),
+                q.value(1).toString() + "\n" + q.value(2).toString(), watches);
+            item->setData(Qt::UserRole, q.value(0));
+            item->setData(Qt::UserRole + 1, q.value(1));
+            item->setData(Qt::UserRole + 2, q.value(2));
+            item->setToolTip(q.value(1).toString() + " · " + q.value(2).toString());
+            item->setSizeHint(QSize(180, 68));
+            if (q.value(0).toLongLong() == selected) row = watches->count() - 1;
+        }
+        watches->setCurrentRow(watches->count() ? row : -1);
         selectWatch();
     }
     void selectWatch() {
+        auto item = watches->currentItem();
+        watchId = item ? item->data(Qt::UserRole).toLongLong() : 0;
+        pages->setCurrentIndex(watchId ? 1 : 0);
+        watchTitle->setText(item ? item->data(Qt::UserRole + 1).toString() : "La tua collezione");
+        watchKind->setText(item ? item->data(Qt::UserRole + 2).toString() : "");
         setArmed(false);
-        watchId = watches->currentData().toLongLong();
         QSqlQuery q(db);
         q.prepare("SELECT series FROM watches WHERE id=?"); q.addBindValue(watchId); query(q);
         series = q.next() ? q.value(0).toInt() : 0;
         reloadHistory();
-        result->setText("Prepara la misura, premi stop e inserisci l’ora del tuo orologio");
+        result->setText("Premi Nuova misura, poi Spazio su un secondo preciso.");
+    }
+    void storeOrder() {
+        if (armed || pending) return;
+        if (!db.transaction()) { error(db.lastError().text()); return; }
+        QSqlQuery q(db); q.prepare("UPDATE watches SET sort_order=? WHERE id=?");
+        for (int i = 0; i < watches->count(); ++i) {
+            q.bindValue(0, i); q.bindValue(1, watches->item(i)->data(Qt::UserRole));
+            if (!q.exec()) { db.rollback(); error(q.lastError().text()); reloadWatches(); return; }
+        }
+        if (!db.commit()) { db.rollback(); error(db.lastError().text()); reloadWatches(); return; }
+        setArmed(false);
+    }
+    void moveWatch(int delta) {
+        if (armed || pending) return;
+        int row = watches->currentRow(), destination = row + delta;
+        if (row < 0 || destination < 0 || destination >= watches->count()) return;
+        QSignalBlocker block(watches);
+        auto item = watches->takeItem(row); watches->insertItem(destination, item); watches->setCurrentItem(item);
+        storeOrder();
+    }
+    void alphabetical() {
+        if (armed || pending) return;
+        QSignalBlocker block(watches);
+        watches->sortItems(Qt::AscendingOrder); storeOrder();
     }
     void reloadHistory() {
         QSqlQuery q(db);
@@ -237,6 +303,11 @@ class Window : public QMainWindow {
             for (int c = 0; c < cells.size(); ++c) history->setItem(row, c, new QTableWidgetItem(cells[c]));
             if (q.value(3).toInt() == series) plot->points.push_back({double(t) / 1e9, delta});
         }
+        if (history->rowCount()) {
+            int row = history->rowCount() - 1;
+            double delta = history->item(row, 1)->text().toDouble();
+            latest->setText(QString("Ultimo scarto  %1%2 s").arg(delta >= 0 ? "+" : "").arg(delta, 0, 'f', 3));
+        } else latest->setText("Nessuna misura salvata");
         plot->update();
         const auto &pts = plot->points;
         if (pts.size() < 2 || pts.back().x() - pts.front().x() < 3600) {
@@ -250,18 +321,60 @@ class Window : public QMainWindow {
         }
         history->scrollToBottom();
     }
-    void addWatch() {
-        if (armed || pending) return;
-        bool ok;
-        QString name = QInputDialog::getText(this, "Nuovo orologio", "Nome o modello", QLineEdit::Normal, {}, &ok).trimmed();
-        if (!ok || name.isEmpty()) return;
-        QString kind = QInputDialog::getItem(this, "Movimento", "Tipo", {"Meccanico", "Quarzo"}, 0, false, &ok);
-        if (!ok) return;
-        QSqlQuery q(db); q.prepare("INSERT INTO watches(name,kind) VALUES(?,?)");
-        q.addBindValue(name); q.addBindValue(kind);
+    void watchDialog(bool editing) {
+        if (armed || pending || (editing && !watchId)) return;
+        QDialog dialog(this); dialog.setWindowTitle(editing ? "Modifica orologio" : "Aggiungi orologio");
+        auto layout = new QVBoxLayout(&dialog);
+        auto form = new QFormLayout;
+        QLineEdit name;
+        name.setPlaceholderText("Es. Seiko Presage");
+        QComboBox kind; kind.addItems({"Meccanico", "Quarzo"});
+        if (editing) {
+            name.setText(watches->currentItem()->data(Qt::UserRole + 1).toString());
+            kind.setCurrentText(watches->currentItem()->data(Qt::UserRole + 2).toString());
+        }
+        form->addRow("Nome / modello", &name); form->addRow("Movimento", &kind); layout->addLayout(form);
+        auto buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
+        buttons->button(QDialogButtonBox::Save)->setText(editing ? "Salva" : "Aggiungi");
+        buttons->button(QDialogButtonBox::Cancel)->setText("Annulla");
+        layout->addWidget(buttons);
+        auto validate = [&] { buttons->button(QDialogButtonBox::Save)->setEnabled(!name.text().trimmed().isEmpty()); };
+        connect(&name, &QLineEdit::textChanged, &dialog, validate); validate();
+        connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+        dialog.resize(420, 170);
+        if (dialog.exec() != QDialog::Accepted) return;
+        QSqlQuery q(db);
+        q.prepare(editing ? "UPDATE watches SET name=?,kind=? WHERE id=?"
+            : "INSERT INTO watches(name,kind,sort_order) VALUES(?,?,(SELECT COALESCE(MAX(sort_order),-1)+1 FROM watches))");
+        q.addBindValue(name.text().trimmed()); q.addBindValue(kind.currentText());
+        if (editing) q.addBindValue(watchId);
         if (!q.exec()) { error(q.lastError().text()); return; }
-        qint64 id = q.lastInsertId().toLongLong();
-        reloadWatches(); watches->setCurrentIndex(watches->findData(id));
+        reloadWatches(editing ? watchId : q.lastInsertId().toLongLong());
+    }
+    bool eraseWatch(qint64 id) {
+        if (armed || pending || !id) return false;
+        if (!db.transaction()) return false;
+        for (const char *statement : {"DELETE FROM samples WHERE watch=?", "DELETE FROM watches WHERE id=?"}) {
+            QSqlQuery q(db); q.prepare(statement); q.addBindValue(id);
+            if (!q.exec()) { db.rollback(); error(q.lastError().text()); return false; }
+        }
+        if (!db.commit()) { db.rollback(); error(db.lastError().text()); return false; }
+        reloadWatches();
+        return true;
+    }
+    void deleteWatch() {
+        if (armed || pending || !watchId) return;
+        QSqlQuery q(db); q.prepare("SELECT count(*) FROM samples WHERE watch=?"); q.addBindValue(watchId); query(q); q.next();
+        QMessageBox confirmation(QMessageBox::Warning, "Elimina orologio",
+            QString("Eliminare «%1» e le sue %2 misure?\nL’eliminazione è permanente.")
+                .arg(watches->currentItem()->data(Qt::UserRole + 1).toString()).arg(q.value(0).toInt()),
+            QMessageBox::NoButton, this);
+        auto destroy = confirmation.addButton("Elimina orologio", QMessageBox::DestructiveRole);
+        auto cancelButton = confirmation.addButton("Annulla", QMessageBox::RejectRole);
+        confirmation.setDefaultButton(cancelButton); confirmation.setEscapeButton(cancelButton);
+        confirmation.exec();
+        if (confirmation.clickedButton() == destroy) eraseWatch(watchId);
     }
     void newSeries() {
         if (armed || pending || !watchId) return;
@@ -327,6 +440,17 @@ class Window : public QMainWindow {
         QApplication::setPalette(p);
     }
 protected:
+    void closeEvent(QCloseEvent *event) override {
+        if (pending) {
+            QMessageBox prompt(QMessageBox::Question, "Misura non salvata",
+                "La lettura allo Stop non è ancora salvata.", QMessageBox::NoButton, this);
+            auto close = prompt.addButton("Scarta e chiudi", QMessageBox::DestructiveRole);
+            auto stay = prompt.addButton("Torna alla misura", QMessageBox::RejectRole);
+            prompt.setDefaultButton(stay); prompt.setEscapeButton(stay); prompt.exec();
+            if (prompt.clickedButton() != close) { event->ignore(); return; }
+        }
+        event->accept();
+    }
     bool eventFilter(QObject *object, QEvent *event) override {
         if ((armed || pending) && event->type() == QEvent::KeyPress) {
             auto key = dynamic_cast<QKeyEvent *>(event);
@@ -349,6 +473,37 @@ protected:
         return QMainWindow::eventFilter(object, event);
     }
 public:
+    void exerciseCollection() {
+        const qint64 original = watchId;
+        QSqlQuery q(db);
+        bool ok = q.exec("INSERT INTO watches(name,kind,sort_order) VALUES('Alpha','Meccanico',1)"); sqlCheck(ok, q.lastError());
+        const qint64 alpha = q.lastInsertId().toLongLong();
+        ok = q.exec("INSERT INTO watches(name,kind,sort_order) VALUES('Beta','Quarzo',2)"); sqlCheck(ok, q.lastError());
+        const qint64 beta = q.lastInsertId().toLongLong();
+        reloadWatches(beta);
+        if (watchId != beta || history->rowCount() != 0) throw std::runtime_error("watch selection");
+        moveWatch(-1); reloadWatches(beta);
+        if (watches->currentRow() != 1 || watchId != beta) throw std::runtime_error("persistent ordering");
+        // Exercise the same model move signal emitted by drag and drop.
+        if (!watches->model()->moveRow({}, 1, {}, 0)) throw std::runtime_error("drag model move");
+        reloadWatches(beta);
+        if (watches->currentRow() != 0) throw std::runtime_error("drag ordering persistence");
+        alphabetical(); reloadWatches(beta);
+        if (watches->item(0)->data(Qt::UserRole).toLongLong() != alpha)
+            throw std::runtime_error("alphabetical ordering");
+        reference = parseReference("C0A80101,192.168.1.1,3,0,0,0,0,0,0,0,0.04,0.004,64,Normal", ns(CLOCK_BOOTTIME));
+        prepare(); moveWatch(-1);
+        if (eraseWatch(beta)) throw std::runtime_error("delete while armed");
+        cancel();
+        if (!eraseWatch(beta) || watches->count() != 2) throw std::runtime_error("watch deletion");
+        reloadWatches(original);
+        if (history->rowCount() != 2) throw std::runtime_error("other watch history lost");
+        if (!eraseWatch(original)) throw std::runtime_error("watch with history deletion");
+        q.exec("SELECT count(*) FROM samples"); q.next();
+        if (q.value(0).toInt() != 0) throw std::runtime_error("orphan samples");
+        if (!eraseWatch(alpha) || watchId || pages->currentIndex() != 0)
+            throw std::runtime_error("empty collection state");
+    }
     void exerciseCapture() {
         QSqlQuery q(db);
         bool ok = q.exec("INSERT INTO watches(name,kind) VALUES('Test','Quarzo')"); sqlCheck(ok, q.lastError());
@@ -402,40 +557,107 @@ public:
             "CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY,watch INTEGER NOT NULL REFERENCES watches(id),series INTEGER NOT NULL,utc_ns INTEGER NOT NULL,expected_ms INTEGER NOT NULL,offset REAL NOT NULL,ntp_bound REAL NOT NULL,source TEXT NOT NULL)"}) {
             QSqlQuery q(db); bool ok = q.exec(statement); sqlCheck(ok, q.lastError());
         }
-        setWindowTitle("Watchrate"); setWindowIcon(QIcon::fromTheme("chronometer")); resize(880, 780);
+        QSqlQuery columns("PRAGMA table_info(watches)", db);
+        bool ordered = false;
+        while (columns.next()) ordered |= columns.value(1).toString() == "sort_order";
+        if (!ordered) {
+            QSqlQuery migration(db); bool ok = migration.exec("ALTER TABLE watches ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0");
+            sqlCheck(ok, migration.lastError());
+        }
+        setWindowTitle("Watchrate"); setWindowIcon(QIcon::fromTheme("chronometer")); resize(1080, 820);
         auto central = new QWidget; setCentralWidget(central);
-        auto layout = new QVBoxLayout(central); layout->setContentsMargins(24, 24, 24, 24); layout->setSpacing(14);
-        auto top = new QHBoxLayout;
-        watches = new QComboBox; top->addWidget(watches, 1);
-        auto add = new QPushButton("Aggiungi orologio"); top->addWidget(add);
-        auto reset = new QPushButton("Ho regolato l’ora"); top->addWidget(reset);
-        auto exportButton = new QPushButton("Esporta CSV"); top->addWidget(exportButton); layout->addLayout(top);
-        clock = new QLabel; QFont clockFont = font(); clockFont.setPointSize(36); clockFont.setStyleHint(QFont::Monospace);
-        clock->setFont(clockFont); clock->setAlignment(Qt::AlignCenter); layout->addWidget(clock);
-        referenceLabel = new QLabel; referenceLabel->setAlignment(Qt::AlignCenter); referenceLabel->setWordWrap(true); layout->addWidget(referenceLabel);
-        auto form = new QFormLayout;
-        expected = new QDateTimeEdit(QDateTime::currentDateTime()); expected->setDisplayFormat("dd/MM/yyyy HH:mm:ss"); expected->setCalendarPopup(true);
-        form->addRow("Ora locale del tuo orologio allo stop", expected); layout->addLayout(form);
+        auto outer = new QHBoxLayout(central); outer->setContentsMargins(18, 18, 18, 18); outer->setSpacing(22);
+        auto sidebar = new QFrame; sidebar->setObjectName("sidebar"); sidebar->setFixedWidth(220);
+        auto side = new QVBoxLayout(sidebar); side->setContentsMargins(12, 12, 12, 12); side->setSpacing(10);
+        auto brand = new QLabel("Watchrate"); brand->setObjectName("brand"); side->addWidget(brand);
+        auto caption = new QLabel("LA TUA COLLEZIONE"); caption->setObjectName("muted"); side->addWidget(caption);
+        watches = new QListWidget; watches->setDragDropMode(QAbstractItemView::InternalMove);
+        watches->setDefaultDropAction(Qt::MoveAction); watches->setSpacing(4);
+        watches->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        watches->setSelectionMode(QAbstractItemView::SingleSelection); side->addWidget(watches, 1);
+        auto ordering = new QHBoxLayout;
+        up = new QPushButton("↑"); down = new QPushButton("↓");
+        up->setToolTip("Sposta in alto"); down->setToolTip("Sposta in basso");
+        sortButton = new QToolButton; sortButton->setText("A–Z"); sortButton->setToolTip("Ordina per nome");
+        ordering->addWidget(up); ordering->addWidget(down); ordering->addWidget(sortButton); side->addLayout(ordering);
+        auto reorderHint = new QLabel("Trascina per riordinare"); reorderHint->setObjectName("muted"); side->addWidget(reorderHint);
+        add = new QPushButton("+  Aggiungi orologio"); side->addWidget(add);
+        auto management = new QHBoxLayout;
+        edit = new QPushButton("Modifica"); remove = new QPushButton("Elimina");
+        management->addWidget(edit); management->addWidget(remove); side->addLayout(management); outer->addWidget(sidebar);
+        pages = new QStackedWidget; outer->addWidget(pages, 1);
+        auto empty = new QWidget; auto emptyLayout = new QVBoxLayout(empty);
+        emptyLayout->addStretch(); auto emptyTitle = new QLabel("Ogni orologio ha il suo ritmo."); emptyTitle->setObjectName("heading");
+        emptyTitle->setWordWrap(true); emptyTitle->setAlignment(Qt::AlignCenter); emptyLayout->addWidget(emptyTitle);
+        auto emptyText = new QLabel("Aggiungi il primo orologio per misurare anticipo, ritardo e marcia nel tempo.");
+        emptyText->setWordWrap(true); emptyText->setAlignment(Qt::AlignCenter); emptyLayout->addWidget(emptyText);
+        auto first = new QPushButton("Aggiungi il primo orologio"); emptyLayout->addWidget(first, 0, Qt::AlignCenter);
+        emptyLayout->addStretch(); pages->addWidget(empty);
+        auto detail = new QWidget; pages->addWidget(detail);
+        auto layout = new QVBoxLayout(detail); layout->setContentsMargins(0, 0, 0, 0); layout->setSpacing(14);
+        auto header = new QHBoxLayout; auto names = new QVBoxLayout;
+        watchTitle = new QLabel; watchTitle->setObjectName("heading"); watchTitle->setWordWrap(true);
+        watchKind = new QLabel; watchKind->setObjectName("muted"); names->addWidget(watchTitle); names->addWidget(watchKind); header->addLayout(names, 1);
+        options = new QToolButton; options->setText("•••"); options->setToolTip("Azioni dell’orologio");
+        options->setPopupMode(QToolButton::InstantPopup); auto menu = new QMenu(options);
+        auto reset = menu->addAction("Ho regolato l’ora · nuova serie");
+        auto exportAction = menu->addAction("Esporta storico CSV");
+        menu->addSeparator(); auto info = menu->addAction("Come funziona la misura"); options->setMenu(menu); header->addWidget(options); layout->addLayout(header);
+        auto card = new QFrame; card->setObjectName("measurement");
+        auto measurement = new QVBoxLayout(card); measurement->setContentsMargins(20, 16, 20, 16); measurement->setSpacing(12);
+        phase = new QLabel; phase->setObjectName("phase"); measurement->addWidget(phase);
+        clock = new QLabel; QFont clockFont = font(); clockFont.setPointSize(32); clockFont.setStyleHint(QFont::Monospace);
+        clock->setFont(clockFont); clock->setAlignment(Qt::AlignCenter); measurement->addWidget(clock);
+        referenceLabel = new QLabel; referenceLabel->setObjectName("muted"); referenceLabel->setAlignment(Qt::AlignCenter);
+        referenceLabel->setWordWrap(true); measurement->addWidget(referenceLabel);
+        result = new QLabel; result->setAlignment(Qt::AlignCenter); result->setWordWrap(true); measurement->addWidget(result);
+        reading = new QWidget; auto form = new QVBoxLayout(reading); form->setContentsMargins(0, 2, 0, 2);
+        auto readingLabel = new QLabel("Che ora segnava il tuo orologio allo Stop?"); form->addWidget(readingLabel);
+        expected = new QDateTimeEdit(QDateTime::currentDateTime()); expected->setDisplayFormat("dd/MM/yyyy HH:mm:ss");
+        expected->setCalendarPopup(true); expected->setMinimumHeight(40); form->addWidget(expected); measurement->addWidget(reading);
         auto controls = new QHBoxLayout;
-        arm = new QPushButton("Prepara misura"); capture = new QPushButton("Stop · Spazio"); capture->setEnabled(false);
-        discard = new QPushButton("Scarta"); discard->setEnabled(false);
-        capture->setMinimumHeight(56); controls->addWidget(arm); controls->addWidget(capture, 1); controls->addWidget(discard); layout->addLayout(controls);
-        result = new QLabel; result->setAlignment(Qt::AlignCenter); result->setWordWrap(true); layout->addWidget(result);
-        auto disclaimer = new QLabel("+ anticipo · − ritardo. I millisecondi sono risoluzione, non precisione del gesto.\n"
-            "Il riferimento è l’ora di sistema sincronizzata via NTP; latenza di input e reazione non sono compensate.");
-        disclaimer->setAlignment(Qt::AlignCenter); disclaimer->setWordWrap(true); layout->addWidget(disclaimer);
+        arm = new QPushButton("Nuova misura"); capture = new QPushButton("Stop · Spazio"); discard = new QPushButton("Scarta");
+        arm->setObjectName("primary"); capture->setObjectName("primary"); arm->setMinimumHeight(48); capture->setMinimumHeight(48);
+        controls->addWidget(arm, 1); controls->addWidget(capture, 1); controls->addWidget(discard); measurement->addLayout(controls); layout->addWidget(card);
+        latest = new QLabel; latest->setObjectName("summary"); layout->addWidget(latest);
         rate = new QLabel; rate->setWordWrap(true); layout->addWidget(rate);
-        plot = new Plot; layout->addWidget(plot);
-        history = new QTableWidget(0, 4); history->setHorizontalHeaderLabels({"Misura · ora locale", "Scarto · s", "Limite NTP · ms", "Serie"});
-        history->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch); history->setEditTriggers(QAbstractItemView::NoEditTriggers);
-        history->setAlternatingRowColors(true); layout->addWidget(history, 1);
-        connect(add, &QPushButton::clicked, this, [this] { addWatch(); });
-        connect(reset, &QPushButton::clicked, this, [this] { newSeries(); });
-        connect(exportButton, &QPushButton::clicked, this, [this] { exportCsv(); });
-        connect(watches, &QComboBox::currentIndexChanged, this, [this] { selectWatch(); });
+        plot = new Plot; layout->addWidget(plot, 1);
+        auto historyTitle = new QLabel("Storico delle misure"); historyTitle->setObjectName("section"); layout->addWidget(historyTitle);
+        history = new QTableWidget(0, 4); history->setHorizontalHeaderLabels({"Data e ora", "Scarto · s", "NTP · ms", "Serie"});
+        history->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch); history->verticalHeader()->hide();
+        history->setSelectionBehavior(QAbstractItemView::SelectRows); history->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        history->setAlternatingRowColors(true); history->setMinimumHeight(140); layout->addWidget(history, 1);
+        connect(add, &QPushButton::clicked, this, [this] { watchDialog(false); });
+        connect(first, &QPushButton::clicked, this, [this] { watchDialog(false); });
+        connect(edit, &QPushButton::clicked, this, [this] { watchDialog(true); });
+        connect(remove, &QPushButton::clicked, this, [this] { deleteWatch(); });
+        connect(up, &QPushButton::clicked, this, [this] { moveWatch(-1); });
+        connect(down, &QPushButton::clicked, this, [this] { moveWatch(1); });
+        connect(sortButton, &QToolButton::clicked, this, [this] { alphabetical(); });
+        connect(reset, &QAction::triggered, this, [this] { newSeries(); });
+        connect(exportAction, &QAction::triggered, this, [this] { exportCsv(); });
+        connect(info, &QAction::triggered, this, [this] {
+            QMessageBox::information(this, "Come funziona", "1. Prepara la misura.\n2. Premi Stop o Spazio al passaggio su un secondo preciso.\n"
+                "3. Inserisci l’ora segnata dall’orologio allo Stop e salva.\n\nScarto = lettura − riferimento congelato. + anticipo, − ritardo.\n"
+                "I millisecondi indicano la risoluzione: la reazione e la latenza di input non sono compensate. Il limite NTP riguarda solo il riferimento.");
+        });
+        connect(watches, &QListWidget::currentRowChanged, this, [this] { selectWatch(); });
+        connect(watches, &QListWidget::itemDoubleClicked, this, [this] { watchDialog(true); });
+        connect(watches->model(), &QAbstractItemModel::rowsMoved, this, [this] { storeOrder(); });
         connect(arm, &QPushButton::clicked, this, [this] { prepare(); });
         connect(discard, &QPushButton::clicked, this, [this] { cancel(); });
         connect(capture, &QPushButton::clicked, this, [this] { record(stamp()); });
+        setStyleSheet("QFrame#sidebar, QFrame#measurement { background: palette(base); border-radius: 14px; }"
+            "QListWidget { background: transparent; border: none; }"
+            "QListWidget::item { border-radius: 8px; padding: 6px; }"
+            "QListWidget::item:selected { background: palette(highlight); color: palette(highlighted-text); }"
+            "QLabel#brand { font-size: 22px; font-weight: 700; } QLabel#heading { font-size: 23px; font-weight: 600; }"
+            "QLabel#phase { color: palette(highlight); font-weight: 600; }"
+            "QLabel#section, QLabel#summary { font-weight: 600; }"
+            "QLabel#muted { color: palette(window-text); }"
+            "QPushButton#primary { background: palette(highlight); color: palette(highlighted-text); border: none; border-radius: 9px; font-weight: 600; padding: 10px; }"
+            "QPushButton#primary:disabled { background: palette(button); color: palette(mid); }"
+            "QPushButton#primary:pressed { background: palette(button); color: palette(button-text); }");
         connect(&chrony, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
             reference = code == 0 && status == QProcess::NormalExit
                 ? parseReference(chrony.readAllStandardOutput(), ns(CLOCK_BOOTTIME)) : Reference{};
@@ -451,10 +673,11 @@ public:
                                    : QDateTime::currentDateTime()).toString("HH:mm:ss.zzz"));
             const auto &shown = pending ? capturedReference : reference;
             referenceLabel->setText(pending || referenceReady()
-                ? QString("%1 · %2 · limite stimato ±%3 ms (solo riferimento)")
+                ? QString("%1 · ±%2 ms")
                     .arg(pending ? "Riferimento allo stop" : "NTP sincronizzato")
-                    .arg(shown.source).arg(shown.bound * 1000, 0, 'f', 1)
+                    .arg(shown.bound * 1000, 0, 'f', 1)
                 : reference.valid ? "Stato NTP scaduto: attendo una nuova verifica" : reference.reason);
+            referenceLabel->setToolTip(QString("Sorgente: %1\nLimite stimato del solo riferimento NTP; errore del gesto escluso.").arg(shown.source));
         }); tick->start(33);
         auto poll = new QTimer(this); connect(poll, &QTimer::timeout, this, [this] { refreshReference(); loadTheme(); }); poll->start(5000);
         qApp->installEventFilter(this); reloadWatches(); refreshReference(); loadTheme();
@@ -476,9 +699,20 @@ static int selfTest() {
     check(!parseReference("bad", 1).valid, "malformed reference");
     check(!parseReference("7F7F0101,127.127.1.1,3,0,0,0,0,0,0,0,0,0,64,Normal", 1).valid, "local reference");
     check(!parseReference("C0A80101,x,0,0,nan,0,0,0,0,0,0,0,64,Normal", 1).valid, "invalid reference");
-    Window window(":memory:");
+    QTemporaryDir fixture;
+    const QString legacyFile = fixture.filePath("legacy.sqlite");
+    {
+        auto seed = QSqlDatabase::addDatabase("QSQLITE", "legacy-fixture"); seed.setDatabaseName(legacyFile);
+        bool ok = seed.open(); sqlCheck(ok, seed.lastError());
+        QSqlQuery q(seed);
+        ok = q.exec("CREATE TABLE watches(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,series INTEGER NOT NULL DEFAULT 0)");
+        sqlCheck(ok, q.lastError());
+    }
+    QSqlDatabase::removeDatabase("legacy-fixture");
+    Window window(legacyFile);
     window.exerciseCapture();
-    std::puts("PASS: offset signs, midnight, step/suspend detection, Chrony parsing, SQLite persistence, single-key capture, repeat/focus handling, daily rate, theme reload and UI construction");
+    window.exerciseCollection();
+    std::puts("PASS: measurement, frozen-reference save, clock checks, rate, theme, legacy migration, selection, persistent button/drag/alphabetic order, deletion and empty state");
     return 0;
 }
 

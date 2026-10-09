@@ -2,6 +2,23 @@
 
 Native Qt 6 / Wayland watch offset tracker. Initial prototype, with Italian UI.
 
+## Collection
+
+Select a watch in the sidebar. Drag watches to reorder them, use the up/down
+buttons, or choose A–Z. The order is stored in SQLite and survives restart.
+Add and Edit use a single name/movement dialog; double-click a watch to edit it.
+Deletion asks for explicit confirmation with the watch name and sample count,
+then removes that watch and its samples in one transaction. Other watches and
+their history remain intact. Collection actions are disabled during measurement.
+The existing database is migrated by adding an ordering column; sample data and
+series are preserved. The selected watch remains selected after reorder/edit.
+
+The detail pane progressively presents Prepare, Stop, and Save. Reading entry
+appears after Stop. The watch menu contains new-series, CSV and measurement help.
+Closing with an unsaved reading prompts before discarding it.
+
+## Measurement
+
 Choose a watch and arm the measurement. Press Space once, or press Stop, and
 remember the time its hands indicated at that instant. The reference freezes.
 Enter the watch's local date and time afterwards, then save. Time spent entering
@@ -68,5 +85,8 @@ dock desktop-entry lookup; a direct preview alone cannot verify those features.
 `watchrate --self-test` checks offset signs, midnight arithmetic, clock-step and
 suspend detection, Chrony CSV parsing, SQLite insertion, single-key capture, frozen-reference save,
 auto-repeat suppression, focus-loss cancellation, known daily rate and RGB-list
-theme reload. CTest runs it offscreen.
+theme reload. Collection checks cover legacy migration, selection, persisted
+button/drag/alphabetical ordering, blocked deletion during measurement, related
+sample deletion, unaffected other-watch history and the final empty state.
+CTest runs it offscreen against temporary data, never the user's database.
 Live Wayland identity, visible layout and owner acceptance are separate checks.
