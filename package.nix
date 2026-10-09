@@ -4,11 +4,13 @@
   cmake,
   qt6,
   chrony,
+  makeFontsConf,
 }:
 stdenv.mkDerivation {
   pname = "watchrate";
-  version = "0.2.0";
+  version = "0.3.0";
   src = lib.cleanSource ./.;
+  env.LANG = "C.UTF-8";
   nativeBuildInputs = [
     cmake
     qt6.wrapQtAppsHook
@@ -30,8 +32,16 @@ stdenv.mkDerivation {
     export QT_QPA_PLATFORMTHEME=""
     export XDG_RUNTIME_DIR="$TMPDIR/runtime"
     export XDG_CONFIG_HOME="$TMPDIR/config"
-    mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME"
-    ctest --output-on-failure
+    export XDG_CACHE_HOME="$TMPDIR/cache"
+    export FONTCONFIG_FILE="${
+      makeFontsConf {
+        fontDirectories = [ ];
+        impureFontDirectories = [ ];
+        includes = [ ];
+      }
+    }"
+    mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+    ctest --verbose
     runHook postCheck
   '';
   meta = {

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(watchrate VERSION 0.2.0 LANGUAGES CXX)
+project(watchrate VERSION 0.3.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Qt6 REQUIRED COMPONENTS Widgets Sql)
@@ -13,4 +13,4 @@ install(FILES data/watchrate.svg DESTINATION share/icons/hicolor/scalable/apps R
 install(FILES data/watchrate.png DESTINATION share/icons/hicolor/512x512/apps RENAME dev.ooonea.Watchrate.png)
 include(CTest)
 add_test(NAME measurement COMMAND watchrate --self-test)
-set_tests_properties(measurement PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+set_tests_properties(measurement PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)

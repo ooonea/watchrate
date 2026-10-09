@@ -34,6 +34,8 @@
 #include <QDir>
 #include <QTimeZone>
 #include <QTemporaryDir>
+#include <QRegularExpression>
+#include <QDataStream>
 #include <QtSql>
 #include <cmath>
 #include <stdexcept>
@@ -97,6 +99,56 @@ static void sqlCheck(bool ok, const QSqlError &error) {
     if (!ok) throw std::runtime_error(error.text().toStdString());
 }
 
+static const QString watchesSchema = "CREATE TABLE watches(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,series INTEGER NOT NULL DEFAULT 0)";
+static const QString samplesSchema = "CREATE TABLE samples(id INTEGER PRIMARY KEY,watch INTEGER NOT NULL REFERENCES watches(id),series INTEGER NOT NULL,utc_ns INTEGER NOT NULL,expected_ms INTEGER NOT NULL,offset REAL NOT NULL,ntp_bound REAL NOT NULL,source TEXT NOT NULL)";
+
+struct ArchiveInfo {
+    QString error;
+    bool ordered = false;
+    qint64 watches = 0, samples = 0;
+};
+
+static ArchiveInfo inspectArchive(const QString &path) {
+    ArchiveInfo info;
+    {
+        auto archive = QSqlDatabase::addDatabase("QSQLITE", "archive-inspection");
+        archive.setConnectOptions("QSQLITE_OPEN_READONLY"); archive.setDatabaseName(path);
+        auto inspect = [&]() -> QString {
+            if (!archive.open()) return "Il file non è un archivio SQLite leggibile.";
+            QSqlQuery q(archive);
+            if (!q.exec("PRAGMA trusted_schema=OFF")) return "Impossibile verificare l’archivio.";
+            auto normalize = [](QString sql) {
+                return sql.toUpper().remove("IF NOT EXISTS").remove(QRegularExpression("\\s"));
+            };
+            QString orderedSchema = watchesSchema;
+            orderedSchema.chop(1); orderedSchema += ",sort_order INTEGER NOT NULL DEFAULT 0)";
+            if (!q.exec("SELECT type,name,sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'"))
+                return "Schema dell’archivio non leggibile.";
+            int tables = 0;
+            while (q.next()) {
+                if (q.value(0).toString() != "table") return "L’archivio contiene uno schema non supportato.";
+                const QString name = q.value(1).toString(), schema = normalize(q.value(2).toString());
+                if (name == "watches") {
+                    info.ordered = schema == normalize(orderedSchema);
+                    if (!info.ordered && schema != normalize(watchesSchema)) return "Formato degli orologi non supportato.";
+                } else if (name != "samples" || schema != normalize(samplesSchema)) return "Formato dell’archivio non supportato.";
+                ++tables;
+            }
+            if (tables != 2) return "Il file non contiene un archivio completo Watchrate.";
+            if (!q.exec("PRAGMA integrity_check") || !q.next() || q.value(0).toString() != "ok")
+                return "L’archivio è danneggiato: nessun dato sarà sostituito.";
+            if (!q.exec("PRAGMA foreign_key_check") || q.next()) return "L’archivio contiene misure senza orologio.";
+            if (!q.exec("SELECT (SELECT count(*) FROM watches),(SELECT count(*) FROM samples)") || !q.next())
+                return "Impossibile leggere il contenuto dell’archivio.";
+            info.watches = q.value(0).toLongLong(); info.samples = q.value(1).toLongLong();
+            return {};
+        };
+        info.error = inspect();
+    }
+    QSqlDatabase::removeDatabase("archive-inspection");
+    return info;
+}
+
 class Plot : public QWidget {
 public:
     QVector<QPointF> points;
@@ -135,7 +187,7 @@ class Window : public QMainWindow {
     QSqlDatabase db;
     QListWidget *watches;
     QPushButton *add, *edit, *remove, *up, *down, *removeSamples;
-    QToolButton *sortButton, *options;
+    QToolButton *sortButton, *options, *archiveMenu;
     QLabel *watchTitle, *watchKind, *phase, *latest;
     QWidget *reading;
     QStackedWidget *pages;
@@ -185,6 +237,7 @@ class Window : public QMainWindow {
         down->setEnabled(idle && watches->currentRow() >= 0 && watches->currentRow() + 1 < watches->count());
         sortButton->setEnabled(idle && watches->count() > 1);
         options->setEnabled(idle && watchId);
+        archiveMenu->setEnabled(idle);
         updateSampleAction();
     }
     void prepare() {
@@ -232,6 +285,103 @@ class Window : public QMainWindow {
         pending = false;
         setArmed(false);
         result->setText("Misura annullata");
+    }
+    bool sameDatabase(const QString &path) const {
+        const QFileInfo source(db.databaseName()), target(path);
+        return source.absoluteFilePath() == target.absoluteFilePath()
+            || (!source.canonicalFilePath().isEmpty() && source.canonicalFilePath() == target.canonicalFilePath());
+    }
+    QString writeArchive(const QString &path) {
+        if (armed || pending) return "Termina o scarta prima la misura in corso.";
+        if (sameDatabase(path)) return "Scegli un file diverso dal database in uso.";
+        QTemporaryDir temp;
+        if (!temp.isValid()) return "Impossibile creare il backup temporaneo.";
+        QString snapshot = temp.filePath("archive.sqlite");
+        {
+            QSqlQuery q(db); q.prepare("VACUUM main INTO ?"); q.addBindValue(snapshot);
+            if (!q.exec()) return q.lastError().text();
+        }
+        QFile source(snapshot);
+        QSaveFile destination(path);
+        if (!source.open(QIODevice::ReadOnly)) return source.errorString();
+        if (!destination.open(QIODevice::WriteOnly)) return destination.errorString();
+        if (!destination.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner))
+            return "Impossibile proteggere il file di backup.";
+        while (!source.atEnd()) {
+            QByteArray block = source.read(1024 * 1024);
+            if (source.error() != QFileDevice::NoError) return source.errorString();
+            if (destination.write(block) != block.size()) return destination.errorString();
+        }
+        return destination.commit() ? QString() : destination.errorString();
+    }
+    QString applyArchive(const QString &path, bool ordered) {
+        if (armed || pending) return "Termina o scarta prima la misura in corso.";
+        const qint64 previousWatch = watchId;
+        {
+            QSqlQuery q(db); q.prepare("ATTACH DATABASE ? AS recovered"); q.addBindValue(path);
+            if (!q.exec()) return q.lastError().text();
+        }
+        QString failure;
+        if (!db.transaction()) failure = db.lastError().text();
+        else {
+            const QStringList statements{
+                "DELETE FROM main.samples", "DELETE FROM main.watches",
+                QString("INSERT INTO main.watches(id,name,kind,series,sort_order) SELECT id,name,kind,series,%1 FROM recovered.watches")
+                    .arg(ordered ? "sort_order" : "0"),
+                "INSERT INTO main.samples(id,watch,series,utc_ns,expected_ms,offset,ntp_bound,source) SELECT id,watch,series,utc_ns,expected_ms,offset,ntp_bound,source FROM recovered.samples"};
+            for (const QString &statement : statements) {
+                QSqlQuery q(db);
+                if (!q.exec(statement)) { failure = q.lastError().text(); break; }
+            }
+            if (failure.isEmpty() && !db.commit()) failure = db.lastError().text();
+            if (!failure.isEmpty()) db.rollback();
+        }
+        {
+            QSqlQuery q(db);
+            if (!q.exec("DETACH DATABASE recovered")) failure += "\n" + q.lastError().text();
+        }
+        reloadWatches(failure.isEmpty() ? -1 : previousWatch);
+        if (failure.isEmpty()) result->setText("Archivio ripristinato");
+        return failure;
+    }
+    void backupArchive() {
+        if (armed || pending) return;
+        const QString name = "watchrate-" + QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss") + ".sqlite";
+        const QString directory = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+        const QString path = QFileDialog::getSaveFileName(this, "Backup dell’intero archivio", QDir(directory).filePath(name), "Archivio Watchrate (*.sqlite)");
+        if (path.isEmpty()) return;
+        const QString failure = writeArchive(path);
+        if (!failure.isEmpty()) error(failure);
+        else QMessageBox::information(this, "Backup completato", "Orologi, ordine, serie e tutte le misure sono stati salvati nel file scelto.");
+    }
+    void restoreArchive() {
+        if (armed || pending) return;
+        const QString path = QFileDialog::getOpenFileName(this, "Ripristina archivio",
+            QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation), "Archivio Watchrate (*.sqlite);;Tutti i file (*)");
+        if (path.isEmpty()) return;
+        if (sameDatabase(path)) { error("Questo è il database già in uso."); return; }
+        QTemporaryDir temp;
+        const QString snapshot = temp.filePath("restore.sqlite");
+        if (!temp.isValid() || !QFile::copy(path, snapshot)) { error("Impossibile leggere il file scelto."); return; }
+        const ArchiveInfo archive = inspectArchive(snapshot);
+        if (!archive.error.isEmpty()) { error(archive.error); return; }
+        qint64 currentWatches = 0, currentSamples = 0;
+        {
+            QSqlQuery q("SELECT (SELECT count(*) FROM watches),(SELECT count(*) FROM samples)", db);
+            if (!q.next()) { error(q.lastError().text()); return; }
+            currentWatches = q.value(0).toLongLong(); currentSamples = q.value(1).toLongLong();
+        }
+        QMessageBox confirmation(QMessageBox::Warning, "Sostituisci archivio",
+            QString("Archivio attuale: %1 orologi, %2 misure.\nBackup scelto: %3 orologi, %4 misure.\n\n"
+                    "Il ripristino sostituisce tutti i dati attuali. Crea prima un backup se vuoi conservarli.")
+                .arg(currentWatches).arg(currentSamples).arg(archive.watches).arg(archive.samples), QMessageBox::NoButton, this);
+        auto restore = confirmation.addButton("Sostituisci con il backup", QMessageBox::DestructiveRole);
+        auto cancelButton = confirmation.addButton("Annulla", QMessageBox::RejectRole);
+        confirmation.setDefaultButton(cancelButton); confirmation.setEscapeButton(cancelButton); confirmation.exec();
+        if (confirmation.clickedButton() != restore) return;
+        const QString failure = applyArchive(snapshot, archive.ordered);
+        if (!failure.isEmpty()) error(failure);
+        else QMessageBox::information(this, "Ripristino completato", "L’archivio è stato recuperato dal backup.");
     }
     void reloadWatches(qint64 selected = 0) {
         if (!selected) selected = watchId;
@@ -519,6 +669,83 @@ protected:
         return QMainWindow::eventFilter(object, event);
     }
 public:
+    void exerciseArchives() {
+        const qint64 original = watchId;
+        QSqlQuery q(db);
+        bool ok = q.exec("INSERT INTO watches(name,kind,series,sort_order) VALUES('Backup fixture','Meccanico',4,-1)");
+        sqlCheck(ok, q.lastError()); const qint64 extra = q.lastInsertId().toLongLong();
+        q.prepare("INSERT INTO samples(watch,series,utc_ns,expected_ms,offset,ntp_bound,source) VALUES(?,4,1790000000123456789,1790000001234,1.110543211,0.03,'fixture')");
+        q.addBindValue(extra); query(q); q.finish();
+        auto contents = [&] {
+            QByteArray bytes; QDataStream stream(&bytes, QIODevice::WriteOnly);
+            for (const QString &sql : {QString("SELECT * FROM watches ORDER BY id"), QString("SELECT * FROM samples ORDER BY id")}) {
+                QSqlQuery rows(sql, db);
+                while (rows.next()) for (int i = 0; i < rows.record().count(); ++i) stream << rows.value(i);
+            }
+            return bytes;
+        };
+        const QByteArray before = contents();
+        QTemporaryDir temp; const QString backup = temp.filePath("backup.sqlite");
+        QString failure = writeArchive(backup);
+        if (!failure.isEmpty()) throw std::runtime_error(failure.toStdString());
+        const ArchiveInfo archive = inspectArchive(backup);
+        if (!archive.error.isEmpty() || !archive.ordered || archive.watches != 2 || archive.samples != 3)
+            throw std::runtime_error("complete archive validation");
+        if (contents() != before) throw std::runtime_error("backup changed live data");
+        if (QFileInfo(backup).permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther | QFileDevice::WriteGroup | QFileDevice::WriteOther))
+            throw std::runtime_error("backup permissions");
+        if (writeArchive(db.databaseName()).isEmpty()) throw std::runtime_error("backup overwrote live database");
+        failure = writeArchive(backup);
+        if (!failure.isEmpty()) throw std::runtime_error("atomic backup replacement");
+        ok = q.exec("CREATE TRIGGER fail_restore BEFORE INSERT ON watches BEGIN SELECT RAISE(ABORT,'fixture rollback'); END");
+        sqlCheck(ok, q.lastError()); q.finish();
+        if (applyArchive(backup, true).isEmpty() || contents() != before)
+            throw std::runtime_error("failed restore did not roll back");
+        ok = q.exec("DROP TRIGGER fail_restore"); sqlCheck(ok, q.lastError()); q.finish();
+        q.exec("UPDATE watches SET name='Changed',series=0,sort_order=9"); q.finish();
+        q.exec("DELETE FROM samples"); q.finish();
+        failure = applyArchive(backup, true);
+        if (!failure.isEmpty() || contents() != before) throw std::runtime_error("complete archive round trip");
+        if (watches->item(0)->data(Qt::UserRole).toLongLong() != extra) throw std::runtime_error("restored manual ordering");
+        QFile invalid(temp.filePath("invalid.sqlite"));
+        if (!invalid.open(QIODevice::WriteOnly) || invalid.write("not a database") != 14)
+            throw std::runtime_error("invalid archive fixture creation");
+        invalid.close();
+        if (inspectArchive(invalid.fileName()).error.isEmpty() || contents() != before)
+            throw std::runtime_error("invalid archive accepted");
+        const QString modified = temp.filePath("modified.sqlite");
+        QFile::copy(backup, modified);
+        auto modify = [&](const QString &sql) {
+            {
+                auto fixture = QSqlDatabase::addDatabase("QSQLITE", "archive-fixture"); fixture.setDatabaseName(modified);
+                bool opened = fixture.open(); sqlCheck(opened, fixture.lastError());
+                QSqlQuery change(fixture); bool changed = change.exec(sql); sqlCheck(changed, change.lastError());
+            }
+            QSqlDatabase::removeDatabase("archive-fixture");
+        };
+        modify("CREATE TRIGGER sqliteXunexpected AFTER INSERT ON watches BEGIN DELETE FROM samples; END");
+        if (inspectArchive(modified).error.isEmpty()) throw std::runtime_error("archive trigger accepted");
+        modify("DROP TRIGGER sqliteXunexpected");
+        modify("UPDATE samples SET watch=999");
+        if (inspectArchive(modified).error.isEmpty()) throw std::runtime_error("orphan archive samples accepted");
+        modify("UPDATE samples SET watch=1");
+        modify("ALTER TABLE watches DROP COLUMN sort_order");
+        const ArchiveInfo legacy = inspectArchive(modified);
+        if (!legacy.error.isEmpty() || legacy.ordered) throw std::runtime_error("legacy archive compatibility");
+        failure = applyArchive(modified, false);
+        if (!failure.isEmpty()) throw std::runtime_error("legacy restore");
+        failure = applyArchive(backup, true);
+        if (!failure.isEmpty() || contents() != before) throw std::runtime_error("restore after legacy archive");
+        reloadWatches(original);
+        reference = parseReference("C0A80101,192.168.1.1,3,0,0,0,0,0,0,0,0.04,0.004,64,Normal", ns(CLOCK_BOOTTIME));
+        prepare();
+        if (writeArchive(temp.filePath("blocked.sqlite")).isEmpty() || applyArchive(backup, true).isEmpty() || archiveMenu->isEnabled())
+            throw std::runtime_error("archive action while armed");
+        record(stamp());
+        if (writeArchive(temp.filePath("blocked.sqlite")).isEmpty() || applyArchive(backup, true).isEmpty() || archiveMenu->isEnabled())
+            throw std::runtime_error("archive action while reading pending");
+        cancel(); eraseWatch(extra); reloadWatches(original);
+    }
     void exerciseSampleDeletion() {
         const qint64 original = watchId;
         QSqlQuery q(db); bool ok = q.exec("INSERT INTO watches(name,kind,sort_order) VALUES('Deletion test','Quarzo',3)");
@@ -578,8 +805,14 @@ public:
         if (!eraseWatch(original)) throw std::runtime_error("watch with history deletion");
         q.exec("SELECT count(*) FROM samples"); q.next();
         if (q.value(0).toInt() != 0) throw std::runtime_error("orphan samples");
+        q.finish();
         if (!eraseWatch(alpha) || watchId || pages->currentIndex() != 0)
             throw std::runtime_error("empty collection state");
+        QTemporaryDir empty;
+        const QString path = empty.filePath("empty.sqlite");
+        if (!archiveMenu->isEnabled() || !writeArchive(path).isEmpty()) throw std::runtime_error("empty archive backup");
+        const ArchiveInfo info = inspectArchive(path);
+        if (!info.error.isEmpty() || info.watches || info.samples) throw std::runtime_error("empty archive validation");
     }
     void exerciseCapture() {
         QSqlQuery q(db);
@@ -628,10 +861,10 @@ public:
     explicit Window(const QString &database) {
         db = QSqlDatabase::addDatabase("QSQLITE"); db.setDatabaseName(database);
         bool opened = db.open(); sqlCheck(opened, db.lastError());
-        for (const auto &statement : {
-            "PRAGMA foreign_keys=ON",
-            "CREATE TABLE IF NOT EXISTS watches(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,series INTEGER NOT NULL DEFAULT 0)",
-            "CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY,watch INTEGER NOT NULL REFERENCES watches(id),series INTEGER NOT NULL,utc_ns INTEGER NOT NULL,expected_ms INTEGER NOT NULL,offset REAL NOT NULL,ntp_bound REAL NOT NULL,source TEXT NOT NULL)"}) {
+        for (const auto &statement : QStringList{
+            "PRAGMA foreign_keys=ON", "PRAGMA trusted_schema=OFF",
+            QString(watchesSchema).replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS "),
+            QString(samplesSchema).replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")}) {
             QSqlQuery q(db); bool ok = q.exec(statement); sqlCheck(ok, q.lastError());
         }
         QSqlQuery columns("PRAGMA table_info(watches)", db);
@@ -647,6 +880,12 @@ public:
         auto sidebar = new QFrame; sidebar->setObjectName("sidebar"); sidebar->setFixedWidth(220);
         auto side = new QVBoxLayout(sidebar); side->setContentsMargins(12, 12, 12, 12); side->setSpacing(10);
         auto brand = new QLabel("Watchrate"); brand->setObjectName("brand"); side->addWidget(brand);
+        archiveMenu = new QToolButton; archiveMenu->setText("Archivio"); archiveMenu->setPopupMode(QToolButton::InstantPopup);
+        auto archives = new QMenu(archiveMenu);
+        auto backup = archives->addAction("Backup archivio…"); auto restore = archives->addAction("Ripristina archivio…");
+        archiveMenu->setMenu(archives); side->addWidget(archiveMenu);
+        connect(backup, &QAction::triggered, this, [this] { backupArchive(); });
+        connect(restore, &QAction::triggered, this, [this] { restoreArchive(); });
         auto caption = new QLabel("LA TUA COLLEZIONE"); caption->setObjectName("muted"); side->addWidget(caption);
         watches = new QListWidget; watches->setDragDropMode(QAbstractItemView::InternalMove);
         watches->setDefaultDropAction(Qt::MoveAction); watches->setSpacing(4);
@@ -674,6 +913,7 @@ public:
         auto layout = new QVBoxLayout(detail); layout->setContentsMargins(0, 0, 0, 0); layout->setSpacing(14);
         auto header = new QHBoxLayout; auto names = new QVBoxLayout;
         watchTitle = new QLabel; watchTitle->setObjectName("heading"); watchTitle->setWordWrap(true);
+        watchTitle->setTextFormat(Qt::PlainText);
         watchKind = new QLabel; watchKind->setObjectName("muted"); names->addWidget(watchTitle); names->addWidget(watchKind); header->addLayout(names, 1);
         options = new QToolButton; options->setText("•••"); options->setToolTip("Azioni dell’orologio");
         options->setPopupMode(QToolButton::InstantPopup); auto menu = new QMenu(options);
@@ -796,9 +1036,10 @@ static int selfTest() {
     QSqlDatabase::removeDatabase("legacy-fixture");
     Window window(legacyFile);
     window.exerciseCapture();
+    window.exerciseArchives();
     window.exerciseSampleDeletion();
     window.exerciseCollection();
-    std::puts("PASS: measurement, frozen-reference save, clock checks, rate, theme, legacy migration, selection, persistent button/drag/alphabetic order, deletion and empty state");
+    std::puts("PASS: measurement, frozen-reference save, clock checks, rate, theme, migration, collection/history actions, complete/legacy/empty archive recovery, validation, permissions and rollback");
     return 0;
 }
 
@@ -812,5 +1053,5 @@ int main(int argc, char **argv) {
         if (!QDir().mkpath(path)) throw std::runtime_error("Cannot create application data directory");
         Window window(path + "/watchrate.sqlite"); window.show();
         return app.exec();
-    } catch (const std::exception &e) { qCritical("Watchrate: %s", e.what()); return 1; }
+    } catch (const std::exception &e) { std::fprintf(stderr, "Watchrate: %s\n", e.what()); return 1; }
 }

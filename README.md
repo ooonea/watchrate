@@ -47,8 +47,8 @@ rounding an arbitrary hand position to the second-resolution input.
 Positive offset means the watch is fast. The reference is CLOCK_REALTIME,
 disciplined externally by Chrony, not a direct connection to an atomic clock.
 Chrony must report a synchronized external reference. Its estimated clock-error
-bound is saved with each sample: absolute system correction + root dispersion
-+ half root delay. The UI checks Chrony every five seconds and rejects status
+bound is saved with each sample: `abs(system correction) + root dispersion + root delay / 2`.
+The UI checks Chrony every five seconds and rejects status
 older than fifteen seconds. This is a snapshot, not a certified error bound.
 No privileged command or clock adjustment is performed.
 
@@ -82,6 +82,26 @@ The database is stored beneath Qt's XDG application data directory
 (`$XDG_DATA_HOME/ooonea/watchrate/watchrate.sqlite` by default). CSV timestamps
 are UTC. The app runs without a background service or listener.
 
+## Backup and restore
+
+The sidebar Archive menu is available even for an empty collection. Backup archive
+saves a consistent SQLite snapshot of every watch, its manual order, all series
+and measurements. It uses SQLite VACUUM INTO, then an atomic file save with
+owner-only read/write permissions. It works while the database is open and can
+replace an existing backup after the file dialog's overwrite confirmation.
+
+Restore archive checks a private staged copy for supported Watchrate schema,
+integrity and sample references before showing a confirmation with current and
+backup watch/sample counts. It replaces the current archive in a single database
+transaction; a failed transaction leaves the previous records intact. Save a
+backup first if you want to keep the current archive. Legacy archives without
+manual ordering are also supported. Invalid files or additional schema objects
+are rejected. Backup/restore are disabled during an armed or pending measurement.
+
+These files contain the entire watch collection and its history, not desktop
+theme configuration or the application's executable. CSV is separate from a
+recoverable archive. Store backups separately from the machine for disk recovery.
+
 ## Noctalia / Umbriel
 
 The desktop entry and live Wayland app_id are `dev.ooonea.Watchrate`.
@@ -108,6 +128,9 @@ sample deletion, unaffected other-watch history and the final empty state.
 History tests cover single and multiple selection/deletion, measurement-state
 guards, recalculated graph/rate/empty state, and preservation of other watches.
 CTest runs it offscreen against temporary data, never the user's database.
+Archive tests cover full round trips, exact row/order/series/precision preservation,
+permissions, atomic overwrite, rollback on failed restore, invalid/schema/foreign
+key rejection, legacy compatibility and measurement-state guards.
 Live Wayland identity, visible layout and owner acceptance are separate checks.
 
 ## License
