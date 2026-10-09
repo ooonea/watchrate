@@ -17,6 +17,11 @@ The detail pane progressively presents Prepare, Stop, and Save. Reading entry
 appears after Stop. The watch menu contains new-series, CSV and measurement help.
 Closing with an unsaved reading prompts before discarding it.
 
+Select one or more history rows (Ctrl/Shift for multiple selection), then choose
+Delete measurement(s). Confirmation precedes an atomic deletion limited to the
+selected watch. Graph, latest offset and rate are recalculated afterwards.
+Deletion is disabled while armed or while a captured reading is pending.
+
 ## Measurement
 
 Choose a watch and arm the measurement. Press Space once, or press Stop, and
@@ -88,5 +93,7 @@ auto-repeat suppression, focus-loss cancellation, known daily rate and RGB-list
 theme reload. Collection checks cover legacy migration, selection, persisted
 button/drag/alphabetical ordering, blocked deletion during measurement, related
 sample deletion, unaffected other-watch history and the final empty state.
+History tests cover single and multiple selection/deletion, measurement-state
+guards, recalculated graph/rate/empty state, and preservation of other watches.
 CTest runs it offscreen against temporary data, never the user's database.
 Live Wayland identity, visible layout and owner acceptance are separate checks.

@@ -134,7 +134,7 @@ public:
 class Window : public QMainWindow {
     QSqlDatabase db;
     QListWidget *watches;
-    QPushButton *add, *edit, *remove, *up, *down;
+    QPushButton *add, *edit, *remove, *up, *down, *removeSamples;
     QToolButton *sortButton, *options;
     QLabel *watchTitle, *watchKind, *phase, *latest;
     QWidget *reading;
@@ -185,6 +185,7 @@ class Window : public QMainWindow {
         down->setEnabled(idle && watches->currentRow() >= 0 && watches->currentRow() + 1 < watches->count());
         sortButton->setEnabled(idle && watches->count() > 1);
         options->setEnabled(idle && watchId);
+        updateSampleAction();
     }
     void prepare() {
         if (pending) { save(); return; }
@@ -291,7 +292,7 @@ class Window : public QMainWindow {
     }
     void reloadHistory() {
         QSqlQuery q(db);
-        q.prepare("SELECT utc_ns,offset,ntp_bound,series FROM samples WHERE watch=? ORDER BY utc_ns");
+        q.prepare("SELECT utc_ns,offset,ntp_bound,series,id FROM samples WHERE watch=? ORDER BY utc_ns,id");
         q.addBindValue(watchId); query(q);
         history->setRowCount(0); plot->points.clear();
         while (q.next()) {
@@ -301,6 +302,7 @@ class Window : public QMainWindow {
                 QString::number(delta, 'f', 3), QString::number(q.value(2).toDouble() * 1000, 'f', 1),
                 QString::number(q.value(3).toInt() + 1)};
             for (int c = 0; c < cells.size(); ++c) history->setItem(row, c, new QTableWidgetItem(cells[c]));
+            history->item(row, 0)->setData(Qt::UserRole, q.value(4));
             if (q.value(3).toInt() == series) plot->points.push_back({double(t) / 1e9, delta});
         }
         if (history->rowCount()) {
@@ -320,6 +322,48 @@ class Window : public QMainWindow {
                 .arg(days < 1 ? " · intervallo breve, errore manuale amplificato" : ""));
         }
         history->scrollToBottom();
+        updateSampleAction();
+    }
+    QList<qint64> selectedSamples() const {
+        QList<qint64> ids;
+        for (const auto &row : history->selectionModel()->selectedRows())
+            ids.append(history->item(row.row(), 0)->data(Qt::UserRole).toLongLong());
+        return ids;
+    }
+    void updateSampleAction() {
+        const int count = selectedSamples().size();
+        removeSamples->setEnabled(count && !armed && !pending);
+        removeSamples->setText(count > 1 ? QString("Elimina %1 misure").arg(count) : "Elimina misura");
+    }
+    bool eraseSamples(const QList<qint64> &ids) {
+        if (armed || pending || !watchId || ids.isEmpty()) return false;
+        if (!db.transaction()) { error(db.lastError().text()); return false; }
+        QSqlQuery q(db); q.prepare("DELETE FROM samples WHERE id=? AND watch=?");
+        for (qint64 id : ids) {
+            q.bindValue(0, id); q.bindValue(1, watchId);
+            if (!q.exec() || q.numRowsAffected() != 1) {
+                db.rollback();
+                error(q.lastError().isValid() ? q.lastError().text() : "Lo storico è cambiato: nessuna misura cancellata.");
+                reloadHistory(); return false;
+            }
+        }
+        if (!db.commit()) { db.rollback(); error(db.lastError().text()); return false; }
+        reloadHistory();
+        result->setText(ids.size() == 1 ? "Misura eliminata" : QString("%1 misure eliminate").arg(ids.size()));
+        return true;
+    }
+    void deleteSamples() {
+        const auto ids = selectedSamples();
+        if (armed || pending || ids.isEmpty()) return;
+        QMessageBox confirmation(QMessageBox::Warning, "Elimina misure",
+            QString("Eliminare %1 %2 di «%3»?\nL’eliminazione è permanente.")
+                .arg(ids.size()).arg(ids.size() == 1 ? "misura selezionata" : "misure selezionate")
+                .arg(watches->currentItem()->data(Qt::UserRole + 1).toString()),
+            QMessageBox::NoButton, this);
+        auto destroy = confirmation.addButton(ids.size() == 1 ? "Elimina misura" : "Elimina misure", QMessageBox::DestructiveRole);
+        auto cancelButton = confirmation.addButton("Annulla", QMessageBox::RejectRole);
+        confirmation.setDefaultButton(cancelButton); confirmation.setEscapeButton(cancelButton); confirmation.exec();
+        if (confirmation.clickedButton() == destroy) eraseSamples(ids);
     }
     void watchDialog(bool editing) {
         if (armed || pending || (editing && !watchId)) return;
@@ -473,6 +517,37 @@ protected:
         return QMainWindow::eventFilter(object, event);
     }
 public:
+    void exerciseSampleDeletion() {
+        const qint64 original = watchId;
+        QSqlQuery q(db); bool ok = q.exec("INSERT INTO watches(name,kind,sort_order) VALUES('Deletion test','Quarzo',3)");
+        sqlCheck(ok, q.lastError()); const qint64 fixture = q.lastInsertId().toLongLong();
+        q.prepare("INSERT INTO samples(watch,series,utc_ns,expected_ms,offset,ntp_bound,source) VALUES(?,0,?,0,?,0.02,'test')");
+        for (int i = 0; i < 3; ++i) {
+            q.bindValue(0, fixture); q.bindValue(1, qint64(i + 1) * 86400000000000LL); q.bindValue(2, i * 2.0); query(q);
+        }
+        reloadWatches(fixture); history->selectRow(0);
+        const auto first = selectedSamples();
+        if (first.size() != 1 || !removeSamples->isEnabled()) throw std::runtime_error("sample selection");
+        reference = parseReference("C0A80101,192.168.1.1,3,0,0,0,0,0,0,0,0.04,0.004,64,Normal", ns(CLOCK_BOOTTIME));
+        prepare();
+        if (eraseSamples(first) || removeSamples->isEnabled()) throw std::runtime_error("sample deletion while armed");
+        cancel();
+        prepare(); record(stamp());
+        if (eraseSamples(first) || removeSamples->isEnabled() || !pending)
+            throw std::runtime_error("sample deletion while reading pending");
+        cancel();
+        if (!eraseSamples(first) || history->rowCount() != 2 || plot->points.size() != 2
+            || !rate->text().contains("2.000 s/giorno"))
+            throw std::runtime_error("single sample deletion and graph refresh");
+        history->selectAll();
+        if (selectedSamples().size() != 2 || !eraseSamples(selectedSamples())
+            || history->rowCount() || !plot->points.isEmpty() || !latest->text().contains("Nessuna")
+            || !rate->text().contains("servono"))
+            throw std::runtime_error("multiple sample deletion and empty history");
+        reloadWatches(original);
+        if (history->rowCount() != 2) throw std::runtime_error("other watch samples changed");
+        eraseWatch(fixture); reloadWatches(original);
+    }
     void exerciseCollection() {
         const qint64 original = watchId;
         QSqlQuery q(db);
@@ -622,15 +697,21 @@ public:
         latest = new QLabel; latest->setObjectName("summary"); layout->addWidget(latest);
         rate = new QLabel; rate->setWordWrap(true); layout->addWidget(rate);
         plot = new Plot; layout->addWidget(plot, 1);
-        auto historyTitle = new QLabel("Storico delle misure"); historyTitle->setObjectName("section"); layout->addWidget(historyTitle);
+        auto historyHeader = new QHBoxLayout;
+        auto historyTitle = new QLabel("Storico delle misure"); historyTitle->setObjectName("section"); historyHeader->addWidget(historyTitle, 1);
+        removeSamples = new QPushButton("Elimina misura"); removeSamples->setEnabled(false); historyHeader->addWidget(removeSamples); layout->addLayout(historyHeader);
         history = new QTableWidget(0, 4); history->setHorizontalHeaderLabels({"Data e ora", "Scarto · s", "NTP · ms", "Serie"});
         history->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch); history->verticalHeader()->hide();
         history->setSelectionBehavior(QAbstractItemView::SelectRows); history->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        history->setSelectionMode(QAbstractItemView::ExtendedSelection);
+        history->setToolTip("Seleziona una misura. Usa Ctrl o Maiusc per selezionarne più di una.");
         history->setAlternatingRowColors(true); history->setMinimumHeight(140); layout->addWidget(history, 1);
         connect(add, &QPushButton::clicked, this, [this] { watchDialog(false); });
         connect(first, &QPushButton::clicked, this, [this] { watchDialog(false); });
         connect(edit, &QPushButton::clicked, this, [this] { watchDialog(true); });
         connect(remove, &QPushButton::clicked, this, [this] { deleteWatch(); });
+        connect(removeSamples, &QPushButton::clicked, this, [this] { deleteSamples(); });
+        connect(history, &QTableWidget::itemSelectionChanged, this, [this] { updateSampleAction(); });
         connect(up, &QPushButton::clicked, this, [this] { moveWatch(-1); });
         connect(down, &QPushButton::clicked, this, [this] { moveWatch(1); });
         connect(sortButton, &QToolButton::clicked, this, [this] { alphabetical(); });
@@ -711,6 +792,7 @@ static int selfTest() {
     QSqlDatabase::removeDatabase("legacy-fixture");
     Window window(legacyFile);
     window.exerciseCapture();
+    window.exerciseSampleDeletion();
     window.exerciseCollection();
     std::puts("PASS: measurement, frozen-reference save, clock checks, rate, theme, legacy migration, selection, persistent button/drag/alphabetic order, deletion and empty state");
     return 0;
