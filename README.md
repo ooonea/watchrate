@@ -1,6 +1,12 @@
 # Watchrate
 
-Native Qt 6 / Wayland watch offset tracker. Initial prototype, with Italian UI.
+<img src="data/watchrate.svg" alt="Watchrate icon" width="96">
+
+Native Linux app for measuring mechanical and quartz watch offset and rate against
+NTP-synchronized system time. Qt 6 / Wayland, local SQLite storage, Italian UI.
+
+Source repositories: [GitHub](https://github.com/ooonea/watchrate) ·
+[Codeberg](https://codeberg.org/ooonea/watchrate).
 
 ## Collection
 
@@ -63,9 +69,14 @@ Ambiguous local times during DST transitions should be avoided in this prototype
 ## Build and run
 
 `nix build` runs the included tests and creates `result/bin/watchrate`.
-`nix run` launches it. The flake pins the same nixpkgs revision used by unicorn
-when the prototype was created. This is a standalone application; it does not
-modify the workstation flake.
+`nix run` launches it. The flake pins nixpkgs for reproducible builds. A Chrony daemon must already
+synchronize the host clock; the package supplies the monitoring client but does
+not configure or adjust the host clock. The app does not modify host configuration.
+
+Without Nix, install Qt 6 Widgets/Sql development files, a C++20 compiler, CMake
+and Chrony. Build with `cmake -S . -B build`, then `cmake --build build`.
+Run `./build/watchrate`. The Qt SQLite and Wayland plugins must be available.
+`cmake --install build --prefix <prefix>` installs the app, desktop entry and icons.
 
 The database is stored beneath Qt's XDG application data directory
 (`$XDG_DATA_HOME/ooonea/watchrate/watchrate.sqlite` by default). CSV timestamps
@@ -81,7 +92,8 @@ An optional `$XDG_CONFIG_HOME/watchrate/theme.ini` overrides these colors;
 `data/noctalia-theme.ini.in` is a Noctalia user-template input for that option.
 No template or compositor rule is installed by running the app.
 
-The icon uses the system `chronometer` icon. No custom raster asset is generated.
+An original watch icon is shipped as scalable SVG and 512px PNG, with a bundled
+PNG fallback for the application window. Both are covered by the MIT license.
 Installing the package into the desktop environment is needed for launcher and
 dock desktop-entry lookup; a direct preview alone cannot verify those features.
 
@@ -97,3 +109,7 @@ History tests cover single and multiple selection/deletion, measurement-state
 guards, recalculated graph/rate/empty state, and preservation of other watches.
 CTest runs it offscreen against temporary data, never the user's database.
 Live Wayland identity, visible layout and owner acceptance are separate checks.
+
+## License
+
+[MIT](LICENSE).

@@ -38,5 +38,6 @@ stdenv.mkDerivation {
     description = "Native single-click watch offset and rate measurements";
     mainProgram = "watchrate";
     platforms = lib.platforms.linux;
+    license = lib.licenses.mit;
   };
 }

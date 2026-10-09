@@ -641,7 +641,7 @@ public:
             QSqlQuery migration(db); bool ok = migration.exec("ALTER TABLE watches ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0");
             sqlCheck(ok, migration.lastError());
         }
-        setWindowTitle("Watchrate"); setWindowIcon(QIcon::fromTheme("chronometer")); resize(1080, 820);
+        setWindowTitle("Watchrate"); setWindowIcon(QIcon::fromTheme("dev.ooonea.Watchrate", QIcon(":/data/watchrate.png"))); resize(1080, 820);
         auto central = new QWidget; setCentralWidget(central);
         auto outer = new QHBoxLayout(central); outer->setContentsMargins(18, 18, 18, 18); outer->setSpacing(22);
         auto sidebar = new QFrame; sidebar->setObjectName("sidebar"); sidebar->setFixedWidth(220);
@@ -771,6 +771,7 @@ public:
 
 static int selfTest() {
     auto check = [](bool ok, const char *name) { if (!ok) throw std::runtime_error(name); };
+    check(!QIcon(":/data/watchrate.png").pixmap(64, 64).isNull(), "bundled application icon");
     check(offset(10000, 9750000000LL) == 0.25, "fast sign");
     check(offset(10000, 10250000000LL) == -0.25, "slow sign");
     check(offset(86400000, 86399000000000LL) == 1.0, "midnight");
