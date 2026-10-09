@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Watchrate
+Comment=Measure watch offset and rate against synchronized time
+Comment[it]=Misura lo scarto e la marcia degli orologi
+Exec=watchrate
+Icon=chronometer
+Terminal=false
+Categories=Utility;Clock;
+StartupNotify=true
