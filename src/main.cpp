@@ -704,6 +704,7 @@ public:
         removeSamples = new QPushButton("Elimina misura"); removeSamples->setEnabled(false); historyHeader->addWidget(removeSamples); layout->addLayout(historyHeader);
         history = new QTableWidget(0, 4); history->setHorizontalHeaderLabels({"Data e ora", "Scarto · s", "NTP · ms", "Serie"});
         history->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch); history->verticalHeader()->hide();
+        history->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
         history->setSelectionBehavior(QAbstractItemView::SelectRows); history->setEditTriggers(QAbstractItemView::NoEditTriggers);
         history->setSelectionMode(QAbstractItemView::ExtendedSelection);
         history->setToolTip("Seleziona una misura. Usa Ctrl o Maiusc per selezionarne più di una.");
