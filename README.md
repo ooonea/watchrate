@@ -2,12 +2,19 @@
 
 Native Qt 6 / Wayland watch offset tracker. Initial prototype, with Italian UI.
 
-Choose a watch, enter the local date and time that its hands will indicate at
-the next landmark, then arm the measurement. Press Space once, or press the
-capture button, as the seconds hand crosses that landmark. Acquisition occurs
-on key/button press, not release. Auto-repeat cannot create additional samples.
-Escape, loss of application focus, a detected clock step or suspend cancels the
-measurement. Fields cannot change while armed.
+Choose a watch and arm the measurement. Press Space once, or press Stop, and
+remember the time its hands indicated at that instant. The reference freezes.
+Enter the watch's local date and time afterwards, then save. Time spent entering
+this reading never affects the captured reference. The displayed reference and
+its Chrony status remain those of the stop, even if synchronization changes later.
+
+Acquisition occurs on key/button press, not release. Auto-repeat cannot create
+additional samples. Escape or Discard cancels the measurement. Loss of application
+focus, a detected clock step or suspend cancels an armed measurement; a reference
+already captured remains available for entry after focus changes. The watch
+selection cannot change until the measurement is saved or discarded. Reading
+entry is enabled only after Stop. Stop on a known whole-second landmark to avoid
+rounding an arbitrary hand position to the second-resolution input.
 
 Positive offset means the watch is fast. The reference is CLOCK_REALTIME,
 disciplined externally by Chrony, not a direct connection to an atomic clock.
@@ -59,7 +66,7 @@ dock desktop-entry lookup; a direct preview alone cannot verify those features.
 ## Validation
 
 `watchrate --self-test` checks offset signs, midnight arithmetic, clock-step and
-suspend detection, Chrony CSV parsing, SQLite insertion, single-key capture,
+suspend detection, Chrony CSV parsing, SQLite insertion, single-key capture, frozen-reference save,
 auto-repeat suppression, focus-loss cancellation, known daily rate and RGB-list
 theme reload. CTest runs it offscreen.
 Live Wayland identity, visible layout and owner acceptance are separate checks.

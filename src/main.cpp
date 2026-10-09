@@ -126,14 +126,16 @@ class Window : public QMainWindow {
     QSqlDatabase db;
     QComboBox *watches;
     QDateTimeEdit *expected;
-    QPushButton *arm, *capture;
+    QPushButton *arm, *capture, *discard;
     QLabel *clock, *referenceLabel, *result, *rate;
     QTableWidget *history;
     Plot *plot;
     QProcess chrony;
     Reference reference;
     Stamp started{};
-    bool armed = false;
+    bool armed = false, pending = false;
+    Stamp captured{};
+    Reference capturedReference;
     qint64 target = 0, watchId = 0;
     int series = 0;
     QString themePath;
@@ -153,42 +155,56 @@ class Window : public QMainWindow {
     }
     void setArmed(bool value) {
         armed = value;
-        expected->setEnabled(!value);
-        watches->setEnabled(!value);
-        arm->setText(value ? "Annulla" : "Prepara misura");
+        expected->setEnabled(pending && !value);
+        watches->setEnabled(!value && !pending);
+        arm->setText(pending ? "Salva misura" : value ? "Annulla" : "Prepara misura");
         capture->setEnabled(value);
-    }
-    void nextMinute() {
-        auto now = QDateTime::currentDateTime();
-        expected->setDateTime(now.addSecs(60 - now.time().second()).addMSecs(-now.time().msec()));
+        discard->setEnabled(value || pending);
     }
     void prepare() {
+        if (pending) { save(); return; }
         if (armed) { setArmed(false); result->setText("Misura annullata"); return; }
         if (!watchId) { error("Aggiungi prima un orologio."); return; }
         if (!referenceReady()) { error("Attendi un riferimento Chrony sincronizzato e aggiornato."); return; }
-        target = expected->dateTime().toMSecsSinceEpoch();
-        if (!expected->dateTime().isValid()) { error("Ora non valida."); return; }
         started = stamp();
         setArmed(true);
         capture->setFocus();
-        result->setText("Premi Spazio al passaggio della lancetta sull’ora indicata");
+        result->setText("Premi Spazio e memorizza l’ora segnata dal tuo orologio allo stop");
     }
     void record(Stamp event) {
         if (!armed) return;
         setArmed(false);
         if (interrupted(started, event)) { error("Misura scartata: salto dell’ora o sospensione durante l’attesa."); return; }
         if (!referenceReady()) { error("Misura scartata: riferimento non più disponibile."); return; }
-        double delta = offset(target, event.utc);
-        if (std::abs(delta) > 43200) { error("Scarto oltre 12 ore: controlla data e ora attesa."); return; }
+        captured = event;
+        capturedReference = reference;
+        pending = true;
+        setArmed(false);
+        expected->setDateTime(QDateTime::fromMSecsSinceEpoch(event.utc / 1000000000 * 1000));
+        result->setText("Riferimento congelato. Inserisci l’ora del tuo orologio allo stop, poi salva.");
+        expected->setFocus();
+    }
+    void save() {
+        if (!pending) return;
+        target = expected->dateTime().toMSecsSinceEpoch();
+        if (!expected->dateTime().isValid()) { error("Ora non valida."); return; }
+        double delta = offset(target, captured.utc);
+        if (std::abs(delta) > 43200) { error("Scarto oltre 12 ore: controlla data e ora segnata allo stop."); return; }
         QSqlQuery q(db);
         q.prepare("INSERT INTO samples(watch,series,utc_ns,expected_ms,offset,ntp_bound,source) VALUES(?,?,?,?,?,?,?)");
-        q.addBindValue(watchId); q.addBindValue(series); q.addBindValue(event.utc); q.addBindValue(target);
-        q.addBindValue(delta); q.addBindValue(reference.bound); q.addBindValue(reference.source);
+        q.addBindValue(watchId); q.addBindValue(series); q.addBindValue(captured.utc); q.addBindValue(target);
+        q.addBindValue(delta); q.addBindValue(capturedReference.bound); q.addBindValue(capturedReference.source);
         try { query(q); reloadHistory(); }
         catch (const std::exception &e) { error(QString::fromUtf8(e.what())); return; }
+        pending = false;
+        setArmed(false);
         result->setText(QString("%1 s · %2").arg(delta, 0, 'f', 3)
                            .arg(delta >= 0 ? "in anticipo" : "in ritardo"));
-        nextMinute();
+    }
+    void cancel() {
+        pending = false;
+        setArmed(false);
+        result->setText("Misura annullata");
     }
     void reloadWatches() {
         QSignalBlocker block(watches);
@@ -205,8 +221,7 @@ class Window : public QMainWindow {
         q.prepare("SELECT series FROM watches WHERE id=?"); q.addBindValue(watchId); query(q);
         series = q.next() ? q.value(0).toInt() : 0;
         reloadHistory();
-        nextMinute();
-        result->setText("Scegli l’ora del prossimo passaggio e prepara la misura");
+        result->setText("Prepara la misura, premi stop e inserisci l’ora del tuo orologio");
     }
     void reloadHistory() {
         QSqlQuery q(db);
@@ -236,7 +251,7 @@ class Window : public QMainWindow {
         history->scrollToBottom();
     }
     void addWatch() {
-        if (armed) return;
+        if (armed || pending) return;
         bool ok;
         QString name = QInputDialog::getText(this, "Nuovo orologio", "Nome o modello", QLineEdit::Normal, {}, &ok).trimmed();
         if (!ok || name.isEmpty()) return;
@@ -249,20 +264,20 @@ class Window : public QMainWindow {
         reloadWatches(); watches->setCurrentIndex(watches->findData(id));
     }
     void newSeries() {
-        if (armed || !watchId) return;
+        if (armed || pending || !watchId) return;
         if (QMessageBox::question(this, "Nuova serie", "Hai regolato l’orologio? Le nuove misure avranno una marcia separata; lo storico resta conservato.") != QMessageBox::Yes) return;
         QSqlQuery q(db); q.prepare("UPDATE watches SET series=series+1 WHERE id=?"); q.addBindValue(watchId);
         if (!q.exec()) { error(q.lastError().text()); return; }
         selectWatch();
     }
     void exportCsv() {
-        if (armed || !watchId) return;
+        if (armed || pending || !watchId) return;
         QString path = QFileDialog::getSaveFileName(this, "Esporta storico", "watchrate.csv", "CSV (*.csv)");
         if (path.isEmpty()) return;
         QSaveFile file(path);
         if (!file.open(QIODevice::WriteOnly)) { error(file.errorString()); return; }
         QTextStream out(&file);
-        out << "utc,expected_utc,offset_seconds,ntp_bound_seconds,source,series\n";
+        out << "utc,watch_utc,offset_seconds,ntp_bound_seconds,source,series\n";
         QSqlQuery q(db);
         q.prepare("SELECT utc_ns,expected_ms,offset,ntp_bound,source,series FROM samples WHERE watch=? ORDER BY utc_ns");
         q.addBindValue(watchId);
@@ -313,14 +328,14 @@ class Window : public QMainWindow {
     }
 protected:
     bool eventFilter(QObject *object, QEvent *event) override {
-        if (armed && event->type() == QEvent::KeyPress) {
+        if ((armed || pending) && event->type() == QEvent::KeyPress) {
             auto key = dynamic_cast<QKeyEvent *>(event);
             if (!key) return false;
-            if (key->key() == Qt::Key_Space) {
+            if (armed && key->key() == Qt::Key_Space) {
                 if (!key->isAutoRepeat()) { const Stamp click = stamp(); record(click); }
                 return true;
             }
-            if (key->key() == Qt::Key_Escape) { setArmed(false); result->setText("Misura annullata"); return true; }
+            if (key->key() == Qt::Key_Escape) { cancel(); return true; }
         }
         if (armed && object == capture && event->type() == QEvent::MouseButtonPress) {
             auto mouse = dynamic_cast<QMouseEvent *>(event);
@@ -346,8 +361,17 @@ public:
         QKeyEvent key(QEvent::KeyPress, Qt::Key_Space, Qt::NoModifier);
         eventFilter(capture, &key);
         eventFilter(capture, &key);
+        if (!pending || armed) throw std::runtime_error("capture did not freeze reference");
+        const qint64 frozenUtc = captured.utc;
+        expected->setDateTime(QDateTime::fromMSecsSinceEpoch(frozenUtc / 1000000 + 2500));
+        const qint64 entered = expected->dateTime().toMSecsSinceEpoch();
+        save();
         q.exec("SELECT count(*) FROM samples"); q.next();
         if (q.value(0).toInt() != 1) throw std::runtime_error("single-click capture duplicated");
+        q.exec("SELECT utc_ns,offset FROM samples"); q.next();
+        if (q.value(0).toLongLong() != frozenUtc
+            || std::abs(q.value(1).toDouble() - offset(entered, frozenUtc)) > 1e-9)
+            throw std::runtime_error("save used current time instead of frozen reference");
         prepare();
         QEvent focus(QEvent::ApplicationDeactivate); eventFilter(this, &focus);
         if (armed) throw std::runtime_error("focus loss did not disarm");
@@ -390,11 +414,12 @@ public:
         clock->setFont(clockFont); clock->setAlignment(Qt::AlignCenter); layout->addWidget(clock);
         referenceLabel = new QLabel; referenceLabel->setAlignment(Qt::AlignCenter); referenceLabel->setWordWrap(true); layout->addWidget(referenceLabel);
         auto form = new QFormLayout;
-        expected = new QDateTimeEdit; expected->setDisplayFormat("dd/MM/yyyy HH:mm:ss"); expected->setCalendarPopup(true);
-        form->addRow("Ora locale indicata dall’orologio al clic", expected); layout->addLayout(form);
+        expected = new QDateTimeEdit(QDateTime::currentDateTime()); expected->setDisplayFormat("dd/MM/yyyy HH:mm:ss"); expected->setCalendarPopup(true);
+        form->addRow("Ora locale del tuo orologio allo stop", expected); layout->addLayout(form);
         auto controls = new QHBoxLayout;
-        arm = new QPushButton("Prepara misura"); capture = new QPushButton("Acquisisci · Spazio"); capture->setEnabled(false);
-        capture->setMinimumHeight(56); controls->addWidget(arm); controls->addWidget(capture, 1); layout->addLayout(controls);
+        arm = new QPushButton("Prepara misura"); capture = new QPushButton("Stop · Spazio"); capture->setEnabled(false);
+        discard = new QPushButton("Scarta"); discard->setEnabled(false);
+        capture->setMinimumHeight(56); controls->addWidget(arm); controls->addWidget(capture, 1); controls->addWidget(discard); layout->addLayout(controls);
         result = new QLabel; result->setAlignment(Qt::AlignCenter); result->setWordWrap(true); layout->addWidget(result);
         auto disclaimer = new QLabel("+ anticipo · − ritardo. I millisecondi sono risoluzione, non precisione del gesto.\n"
             "Il riferimento è l’ora di sistema sincronizzata via NTP; latenza di input e reazione non sono compensate.");
@@ -409,6 +434,7 @@ public:
         connect(exportButton, &QPushButton::clicked, this, [this] { exportCsv(); });
         connect(watches, &QComboBox::currentIndexChanged, this, [this] { selectWatch(); });
         connect(arm, &QPushButton::clicked, this, [this] { prepare(); });
+        connect(discard, &QPushButton::clicked, this, [this] { cancel(); });
         connect(capture, &QPushButton::clicked, this, [this] { record(stamp()); });
         connect(&chrony, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
             reference = code == 0 && status == QProcess::NormalExit
@@ -421,9 +447,13 @@ public:
         themePath = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + "/watchrate/theme.ini";
         auto tick = new QTimer(this);
         connect(tick, &QTimer::timeout, this, [this] {
-            clock->setText(QDateTime::currentDateTime().toString("HH:mm:ss.zzz"));
-            referenceLabel->setText(referenceReady()
-                ? QString("NTP sincronizzato · %1 · limite stimato ±%2 ms (solo riferimento)").arg(reference.source).arg(reference.bound * 1000, 0, 'f', 1)
+            clock->setText((pending ? QDateTime::fromMSecsSinceEpoch(captured.utc / 1000000)
+                                   : QDateTime::currentDateTime()).toString("HH:mm:ss.zzz"));
+            const auto &shown = pending ? capturedReference : reference;
+            referenceLabel->setText(pending || referenceReady()
+                ? QString("%1 · %2 · limite stimato ±%3 ms (solo riferimento)")
+                    .arg(pending ? "Riferimento allo stop" : "NTP sincronizzato")
+                    .arg(shown.source).arg(shown.bound * 1000, 0, 'f', 1)
                 : reference.valid ? "Stato NTP scaduto: attendo una nuova verifica" : reference.reason);
         }); tick->start(33);
         auto poll = new QTimer(this); connect(poll, &QTimer::timeout, this, [this] { refreshReference(); loadTheme(); }); poll->start(5000);
